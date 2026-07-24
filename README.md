@@ -1,6 +1,6 @@
 # grpc-demo
 
-一个基于 Go 语言的 gRPC 入门示例项目，演示如何使用 Protocol Buffers 定义服务、生成代码，并实现服务端与客户端通信。
+一个基于 Go 语言的 gRPC 示例项目，演示如何使用 Protocol Buffers 定义服务，并通过 **etcd 实现服务注册与发现**。
 
 ## 项目结构
 
@@ -12,11 +12,11 @@ grpc-demo/
 │   ├── hello/               # protoc 生成的 Go 代码
 │   └── user/                # protoc 生成的 Go 代码
 ├── server/
-│   ├── main.go              # gRPC 服务端入口
+│   ├── main.go              # gRPC 服务端入口，包含服务注册到 etcd
 │   └── handler/
 │       └── user_handler.go  # UserService 业务逻辑实现
 ├── client/
-│   └── main.go              # gRPC 客户端，调用所有服务
+│   └── main.go              # gRPC 客户端，自定义 etcd resolver 实现服务发现
 ├── go.mod
 └── README.md
 ```
@@ -25,7 +25,7 @@ grpc-demo/
 
 ### 1. Protocol Buffers 服务定义
 
-gRPC 使用 `.proto` 文件描述服务接口和消息格式，再通过 `protoc` 编译器自动生成各语言的桩代码。
+gRPC 使用 `.proto` 文件描述服务接口和消息格式，通过 `protoc` 编译器自动生成各语言的桩代码。
 
 本项目定义了两个服务：
 
@@ -41,21 +41,37 @@ gRPC 使用 `.proto` 文件描述服务接口和消息格式，再通过 `protoc
 
 服务端核心流程：
 
-1. **监听端口**：`net.Listen("tcp", ":50051")` 在本地 50051 端口监听
-2. **创建 gRPC 服务器**：`grpc.NewServer()` 创建服务器实例
-3. **注册服务**：通过 `RegisterGreeterServer` 和 `RegisterUserServiceServer` 将业务实现注册到 gRPC 服务器
-4. **启动服务**：`s.Serve(lis)` 阻塞监听，接收并处理客户端请求
+1. **连接 etcd**：通过 `clientv3.New` 连接到 `localhost:2379` 的 etcd 实例
+2. **创建租约**：`etcdClient.Grant(ctx, 10)` 创建 TTL 为 10 秒的租约，用于服务健康检查
+3. **监听端口**：`net.Listen("tcp", "0.0.0.0:50051")` 在 50051 端口监听
+4. **注册服务到 etcd**：通过 `etcdClient.Put` 将服务地址写入 etcd，key 为 `my-grpc-service/<IP:Port>`，value 为纯文本地址，并绑定租约
+5. **保持租约**：启动后台 goroutine 通过 `KeepAlive` 自动续租，防止 etcd 过期删除服务记录
+6. **启动 gRPC 服务**：注册 Greeter 和 UserService 实现，阻塞监听请求
 
-业务逻辑通过嵌入 `UnimplementedGreeterServer` / `UnimplementedUserServiceServer` 结构体实现，保证向前兼容。数据存储使用内存 map 模拟数据库。
+业务逻辑通过嵌入 `UnimplementedGreeterServer` / `UnimplementedUserServiceServer` 实现，保证向前兼容。数据存储使用内存 map 模拟。
 
-### 3. 客户端调用
+### 3. 客户端服务发现（自定义 etcd Resolver）
 
-客户端核心流程：
+客户端没有使用 etcd 官方的 `naming/resolver` 包，而是实现了一个**自定义的 gRPC Resolver**，直接读取 etcd 中的纯文本地址：
 
-1. **建立连接**：`grpc.NewClient("localhost:50051", grpc.WithInsecure())` 创建与服务端的连接（未使用 TLS）
-2. **创建客户端桩**：通过 `NewGreeterClient` / `NewUserServiceClient` 生成类型安全的客户端实例
-3. **发起 RPC 调用**：调用客户端方法，传入 `context.Context` 控制超时，gRPC 自动完成序列化、网络传输、反序列化
-4. **处理响应**：接收结构化的响应对象，处理业务错误（如用户不存在时返回 `codes.NotFound`）
+1. **自定义 Resolver Builder**：实现 `resolver.Builder` 接口，注册 scheme 为 `etcd`
+2. **服务发现**：通过 `etcdClient.Get(ctx, "my-grpc-service/", WithPrefix())` 查询所有以 `my-grpc-service/` 为前缀的 key，value 即为服务端地址
+3. **轮询更新**：启动 5 秒间隔的定时器，周期性从 etcd 拉取最新服务地址列表，通过 `cc.UpdateState` 通知 gRPC 更新连接
+4. **建立连接**：`grpc.NewClient("etcd:///my-grpc-service")` 使用自定义 resolver 解析服务地址
+
+### 4. 服务注册与发现流程
+
+```
+服务端                                    etcd                                    客户端
+  │                                        │                                        │
+  ├── Put("my-grpc-service/IP:Port", addr) ─→│                                        │
+  ├── KeepAlive(租约续租) ──────────────────→│                                        │
+  │                                        │    ←── Get("my-grpc-service/", prefix) ──┤
+  │                                        │    ──→ 返回地址列表 ──────────────────────┤
+  │                                        │                                        ├── 建立 gRPC 连接
+  │    ←─────── gRPC 请求 (SayHello) ──────┼─────────────────────────────────────────┤
+  │    ──────── gRPC 响应 ────────────────→┼─────────────────────────────────────────┤
+```
 
 ## 功能演示
 
@@ -66,43 +82,69 @@ gRPC 使用 `.proto` 文件描述服务接口和消息格式，再通过 `protoc
 | 创建用户 | UserService | `CreateUser` | 原子 ID 生成，模拟数据库存储 |
 | 查询用户 | UserService | `GetUser` | 根据 ID 查询用户详情 |
 
-## 运行方式
-
-### 前置条件
+## 前置条件
 
 - Go 1.25+
-- 依赖：`google.golang.org/grpc v1.82.1`、`google.golang.org/protobuf v1.36.11`
+- etcd 运行在 `localhost:2379`
+- 依赖：
+  - `google.golang.org/grpc v1.82.1`
+  - `google.golang.org/protobuf v1.36.11`
+  - `go.etcd.io/etcd/client/v3 v3.7.1`
 
-### 启动服务端
+## 运行方式
+
+### 1. 确保 etcd 已启动
 
 ```bash
-go run server/main.go server/handler/user_handler.go
+# 检查 etcd 是否运行
+curl http://localhost:2379/health
+# 期望输出: {"health":"true","reason":""}
 ```
 
-服务端将在 `localhost:50051` 监听。
+### 2. 启动服务端
 
-### 启动客户端
+```bash
+go run ./server/
+```
+
+服务端将在 `0.0.0.0:50051` 监听，并将服务地址注册到 etcd。
+
+### 3. 启动客户端（另开终端）
 
 ```bash
 # 使用默认名字 "World"
-go run client/main.go
+go run ./client/
 
 # 自定义名字
-go run client/main.go 张三
+go run ./client/ 张三
 ```
 
-### 预期输出
+### 4. 预期输出
 
+**服务端：**
 ```
-SayHello 响应: 你好, World
-GetUserPoints 响应: 用户 张三 的积分是 160
-CreateUser 响应: 用户 王五 创建成功 (用户ID: 1)
-GetUser 响应: 用户 王五, 年龄 28
+✅ etcd 连接成功
+🔑 租约 ID: xxxxxxxx
+📍 服务地址: 10.186.40.167:50051
+✅ 服务注册成功: my-grpc-service/10.186.40.167:50051 -> 10.186.40.167:50051
+🚀 服务端已启动，监听端口 50051...
+```
+
+**客户端：**
+```
+✅ etcd 连接正常
+✅ gRPC 连接创建成功
+发现服务地址: 10.186.40.167:50051
+✅ SayHello 响应: 你好, World
+✅ GetUserPoints 响应: 用户 张三 的积分是 160
+✅ CreateUser 响应: 用户 王五 创建成功 (用户ID: 1)
+✅ GetUser 响应: 用户 王五, 年龄 28
 ```
 
 ## 技术栈
 
 - **语言**：Go
-- **框架**：gRPC + Protocol Buffers
+- **RPC 框架**：gRPC + Protocol Buffers
+- **服务注册与发现**：etcd（自定义 Resolver）
 - **通信协议**：HTTP/2（gRPC 默认传输协议）
 - **序列化**：Protocol Buffers（二进制高效序列化）
