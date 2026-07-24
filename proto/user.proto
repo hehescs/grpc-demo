@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package user;
+
+// 指定生成 Go 代码的路径和包名
+option go_package = "grpc-demo/proto/user";
+
+// 定义用户服务
+service UserService {
+  rpc CreateUser (CreateUserRequest) returns (CreateUserResponse) {}
+  rpc GetUser (GetUserRequest) returns (GetUserResponse) {}
+}
+
+// 创建用户请求
+message CreateUserRequest {
+  string name = 1;
+  int32 age = 2;
+}
+
+// 创建用户响应
+message CreateUserResponse {
+  int32 user_id = 1;
+  string message = 2;
+}
+
+// 查询用户请求
+message GetUserRequest {
+  int32 user_id = 1;
+}
+
+// 查询用户响应
+message GetUserResponse {
+  int32 user_id = 1;
+  string name = 2;
+  int32 age = 3;
+}

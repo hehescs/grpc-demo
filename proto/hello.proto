@@ -1,0 +1,38 @@
+// 声明使用的 proto 版本
+syntax = "proto3";
+
+// 定义包名，用于防止命名冲突
+package hello;
+
+// 指定生成 Go 代码的路径和包名
+option go_package = "grpc-demo/proto/hello";
+
+// 定义服务：包含一个打招呼的方法
+service Greeter {
+  // 一元 RPC：客户端发送请求，服务端返回响应
+  rpc SayHello (HelloRequest) returns (HelloReply) {}
+
+  // 🆕 新增：查询用户积分的方法
+  rpc GetUserPoints (UserRequest) returns (PointsReply) {}
+}
+
+// 定义请求消息格式
+message HelloRequest {
+  string name = 1; // 字段编号 1
+}
+
+// 定义响应消息格式
+message HelloReply {
+  string message = 1;
+}
+
+// 🆕 新增：用户积分请求
+message UserRequest {
+  int32 user_id = 1;
+}
+
+// 🆕 新增：用户积分响应
+message PointsReply {
+  int32 points = 1;
+  string user_name = 2;
+}
