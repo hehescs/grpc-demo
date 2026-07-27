@@ -2,15 +2,17 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"net"
 	"time"
 
-	pb "grpc-demo/proto/hello" // 别名导入生成的代码
-	userpb "grpc-demo/proto/user"
+	pb "grpc-demo/proto/hello"    // 别名导入生成的代码
+	userpb "grpc-demo/proto/user" // 别名导入生成的代码
 	"grpc-demo/server/handler"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.etcd.io/etcd/client/v3/naming/endpoints"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -70,6 +72,71 @@ func (s *server) GetUserPoints(ctx context.Context, req *pb.UserRequest) (*pb.Po
 	}, nil
 }
 
+// func main() {
+// 	// 1. 连接 etcd
+// 	etcdClient, err := clientv3.New(clientv3.Config{
+// 		Endpoints:   []string{"localhost:2379"},
+// 		DialTimeout: 5 * time.Second,
+// 	})
+// 	if err != nil {
+// 		log.Fatalf("连接 etcd 失败: %v", err)
+// 	}
+// 	defer etcdClient.Close()
+// 	log.Println("✅ etcd 连接成功")
+
+// 	// 2. 创建租约
+// 	lease, err := etcdClient.Grant(context.TODO(), 10)
+// 	if err != nil {
+// 		log.Fatalf("创建租约失败: %v", err)
+// 	}
+// 	log.Printf("🔑 租约 ID: %x", lease.ID)
+
+// 	// 3. 监听端口
+// 	lis, err := net.Listen("tcp", "0.0.0.0:50051")
+// 	if err != nil {
+// 		log.Fatalf("监听失败: %v", err)
+// 	}
+
+// 	// 4. 服务地址
+// 	serverIP := "10.186.40.167"
+// 	serverAddr := serverIP + ":50051"
+// 	log.Printf("📍 服务地址: %s", serverAddr)
+
+// 	// 5. 手动写入 etcd
+// 	key := "my-grpc-service/" + serverAddr
+// 	_, err = etcdClient.Put(
+// 		context.TODO(),
+// 		key,
+// 		serverAddr, // 直接存地址
+// 		clientv3.WithLease(lease.ID),
+// 	)
+// 	if err != nil {
+// 		log.Fatalf("注册服务到 etcd 失败: %v", err)
+// 	}
+// 	log.Printf("✅ 服务注册成功: %s -> %s", key, serverAddr)
+
+// 	// 6. 保持租约
+// 	keepAliveChan, err := etcdClient.KeepAlive(context.TODO(), lease.ID)
+// 	if err != nil {
+// 		log.Fatalf("启动续租失败: %v", err)
+// 	}
+// 	go func() {
+// 		for range keepAliveChan {
+// 		}
+// 		log.Println("⚠️ 租约已过期")
+// 	}()
+
+// 	// 7. 启动 gRPC 服务
+// 	s := grpc.NewServer()
+// 	pb.RegisterGreeterServer(s, &server{})
+// 	userpb.RegisterUserServiceServer(s, handler.NewUserServiceHandler())
+
+// 	log.Println("🚀 服务端已启动，监听端口 50051...")
+// 	if err := s.Serve(lis); err != nil {
+// 		log.Fatalf("启动服务失败: %v", err)
+// 	}
+// }
+
 func main() {
 	// 1. 连接 etcd
 	etcdClient, err := clientv3.New(clientv3.Config{
@@ -100,18 +167,26 @@ func main() {
 	serverAddr := serverIP + ":50051"
 	log.Printf("📍 服务地址: %s", serverAddr)
 
-	// 5. 手动写入 etcd
+	// 5. ⭐ 使用 endpoints 包的 Endpoint 结构（JSON 格式）
+	endpoint := endpoints.Endpoint{
+		Addr: serverAddr,
+	}
+	endpointJSON, err := json.Marshal(endpoint)
+	if err != nil {
+		log.Fatalf("序列化 endpoint 失败: %v", err)
+	}
+
 	key := "my-grpc-service/" + serverAddr
 	_, err = etcdClient.Put(
 		context.TODO(),
 		key,
-		serverAddr, // 直接存地址
+		string(endpointJSON),
 		clientv3.WithLease(lease.ID),
 	)
 	if err != nil {
 		log.Fatalf("注册服务到 etcd 失败: %v", err)
 	}
-	log.Printf("✅ 服务注册成功: %s -> %s", key, serverAddr)
+	log.Printf("✅ 服务注册成功: %s -> %s", key, string(endpointJSON))
 
 	// 6. 保持租约
 	keepAliveChan, err := etcdClient.KeepAlive(context.TODO(), lease.ID)

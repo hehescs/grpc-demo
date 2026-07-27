@@ -44,7 +44,10 @@ gRPC 使用 `.proto` 文件描述服务接口和消息格式，通过 `protoc` �
 1. **连接 etcd**：通过 `clientv3.New` 连接到 `localhost:2379` 的 etcd 实例
 2. **创建租约**：`etcdClient.Grant(ctx, 10)` 创建 TTL 为 10 秒的租约，用于服务健康检查
 3. **监听端口**：`net.Listen("tcp", "0.0.0.0:50051")` 在 50051 端口监听
-4. **注册服务到 etcd**：通过 `etcdClient.Put` 将服务地址写入 etcd，key 为 `my-grpc-service/<IP:Port>`，value 为纯文本地址，并绑定租约
+4. **注册服务到 etcd**：
+   - 使用 `endpoints.Endpoint` 结构体封装服务地址
+   - 序列化为 JSON：`{"Addr":"10.186.40.167:50051","Metadata":null}`
+   - 通过 `etcdClient.Put` 将 JSON 写入 etcd，key 为 `my-grpc-service/<IP:Port>`，绑定租约
 5. **保持租约**：启动后台 goroutine 通过 `KeepAlive` 自动续租，防止 etcd 过期删除服务记录
 6. **启动 gRPC 服务**：注册 Greeter 和 UserService 实现，阻塞监听请求
 
@@ -52,22 +55,47 @@ gRPC 使用 `.proto` 文件描述服务接口和消息格式，通过 `protoc` �
 
 ### 3. 客户端服务发现（自定义 etcd Resolver）
 
-客户端没有使用 etcd 官方的 `naming/resolver` 包，而是实现了一个**自定义的 gRPC Resolver**，直接读取 etcd 中的纯文本地址：
+由于 etcd v3.7+ 移除了官方的 resolver 包，本项目实现了一个**自定义的 gRPC Resolver**，需要处理服务器端存储的 JSON 格式数据：
 
+#### etcd 存储格式
+- **服务器端**：使用 `endpoints.Endpoint` 结构体，序列化为 JSON 存储在 etcd 中
+  ```json
+  {"Addr":"10.186.40.167:50051","Metadata":null}
+  ```
+- **key 格式**：`my-grpc-service/<IP:Port>`
+- **租约绑定**：每个服务地址绑定 TTL 为 10 秒的租约，自动续租
+
+#### 自定义 Resolver 实现
 1. **自定义 Resolver Builder**：实现 `resolver.Builder` 接口，注册 scheme 为 `etcd`
-2. **服务发现**：通过 `etcdClient.Get(ctx, "my-grpc-service/", WithPrefix())` 查询所有以 `my-grpc-service/` 为前缀的 key，value 即为服务端地址
-3. **轮询更新**：启动 5 秒间隔的定时器，周期性从 etcd 拉取最新服务地址列表，通过 `cc.UpdateState` 通知 gRPC 更新连接
-4. **建立连接**：`grpc.NewClient("etcd:///my-grpc-service")` 使用自定义 resolver 解析服务地址
+2. **JSON 解析**：从 etcd 读取数据后，先尝试解析 JSON 格式，提取 `Addr` 字段的实际地址
+   ```go
+   var endpoint struct {
+       Addr     string `json:"Addr"`
+       Metadata any    `json:"Metadata"`
+   }
+   if err := json.Unmarshal(value, &endpoint); err == nil {
+       addr = endpoint.Addr  // 使用解析后的地址
+   } else {
+       addr = value          // 兼容纯文本格式
+   }
+   ```
+3. **服务发现**：通过 `etcdClient.Get(ctx, "my-grpc-service/", WithPrefix())` 查询所有服务地址
+4. **轮询更新**：启动 5 秒间隔的定时器，周期性从 etcd 拉取最新地址列表，通过 `cc.UpdateState` 通知 gRPC
+5. **建立连接**：`grpc.NewClient("etcd:///my-grpc-service")` 使用自定义 resolver 解析服务地址
 
 ### 4. 服务注册与发现流程
 
 ```
 服务端                                    etcd                                    客户端
   │                                        │                                        │
-  ├── Put("my-grpc-service/IP:Port", addr) ─→│                                        │
+  ├── 创建 Endpoint ────────────────────────┤                                        │
+  ├── JSON 序列化 ─────────────────────────┤                                        │
+  ├── Put("my-grpc-service/IP:Port",     ─→│                                        │
+  │    {"Addr":"IP:Port","Metadata":null})  │                                        │
   ├── KeepAlive(租约续租) ──────────────────→│                                        │
   │                                        │    ←── Get("my-grpc-service/", prefix) ──┤
-  │                                        │    ──→ 返回地址列表 ──────────────────────┤
+  │                                        │    ──→ 返回 JSON 地址列表 ─────────────────┤
+  │                                        │                                        ├── JSON 解析提取 Addr
   │                                        │                                        ├── 建立 gRPC 连接
   │    ←─────── gRPC 请求 (SayHello) ──────┼─────────────────────────────────────────┤
   │    ──────── gRPC 响应 ────────────────→┼─────────────────────────────────────────┤
@@ -145,6 +173,7 @@ go run ./client/ 张三
 
 - **语言**：Go
 - **RPC 框架**：gRPC + Protocol Buffers
-- **服务注册与发现**：etcd（自定义 Resolver）
+- **服务注册与发现**：etcd（自定义 Resolver，支持 JSON 格式解析）
 - **通信协议**：HTTP/2（gRPC 默认传输协议）
 - **序列化**：Protocol Buffers（二进制高效序列化）
+- **数据格式**：JSON（etcd 服务端存储）、gRPC（服务间通信）
